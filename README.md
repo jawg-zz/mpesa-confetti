@@ -71,3 +71,39 @@ README.md
 | GET | `/events` | SSE live payment feed (`payment` events) |
 | GET | `/api/stats` | `{count, sum, biggest {amount, payer, transactionId} \| null, failed}` |
 | GET | `/api/payments?limit=20` | Newest-first payment array |
+
+## Real payments via Daraja (STK push)
+
+Set Daraja credentials to send real STK pushes from the dashboard Charge panel. Without them the simulator keeps working; `/api/pay` returns `501 not-configured`.
+
+Base URLs: sandbox `https://sandbox.safaricom.co.ke` (default), production `https://api.safaricom.co.ke` (via `MPESA_ENV=production`).
+
+Register the callback URL as `PUBLIC_URL + /callback` (fallback `https://confetti.spidmax.win/callback`). It must be public HTTPS in production so Daraja can reach it.
+
+| Var | Default / notes |
+| --- | --------------- |
+| `MPESA_ENV` | `sandbox`; set `production` for live |
+| `MPESA_CONSUMER_KEY` | Daraja app key (required for real payments) |
+| `MPESA_CONSUMER_SECRET` | Daraja app secret (required for real payments) |
+| `MPESA_SHORTCODE` | Business shortcode (required for real payments) |
+| `MPESA_PASSKEY` | Lipa Na M-Pesa passkey (required for real payments) |
+| `MPESA_TYPE` | `CustomerPayBillOnline` (or `CustomerBuyGoodsOnline`) |
+| `PUBLIC_URL` | Callback base; fallback `https://confetti.spidmax.win/callback` |
+
+```bash
+MPESA_ENV=sandbox \
+MPESA_CONSUMER_KEY=xxx MPESA_CONSUMER_SECRET=yyy \
+MPESA_SHORTCODE=174379 MPESA_PASSKEY=zzz \
+PUBLIC_URL=https://confetti.spidmax.win \
+npm start
+```
+
+Charge a phone:
+
+```bash
+curl -X POST http://localhost:4100/api/pay \
+  -H 'Content-Type: application/json' \
+  -d '{"phone":"0712345678","amount":100}'
+```
+
+`501 {error:'not-configured'}` means Daraja env vars are missing — set them or keep using the simulator. `502` means Daraja rejected the request (see `errorMessage`); `400` is a validation error (bad phone/amount).

@@ -119,6 +119,167 @@ app.get('/api/payments', (req, res) => {
   res.json(payments.slice(-limit).reverse());
 });
 
+// Daraja (Safaricom) STK-push
+function normalizePhone(raw) {
+  let s = String(raw == null ? '' : raw).replace(/\D/g, '');
+  if (s.length === 10 && (s.startsWith('07') || s.startsWith('01'))) return '254' + s.slice(1);
+  if (s.length === 12 && s.startsWith('254') && (s[3] === '7' || s[3] === '1')) return s;
+  if (s.length === 9 && (s[0] === '7' || s[0] === '1')) return '254' + s;
+  return null;
+}
+
+function buildStkPassword(shortcode, passkey, timestamp) {
+  return Buffer.from(String(shortcode) + String(passkey) + String(timestamp)).toString('base64');
+}
+
+function stampNow(d) {
+  const t = d || new Date();
+  const p = (n, l) => String(n).padStart(l || 2, '0');
+  return t.getFullYear() + p(t.getMonth() + 1) + p(t.getDate()) + p(t.getHours()) + p(t.getMinutes()) + p(t.getSeconds());
+}
+
+function darajaBaseUrl() {
+  return process.env.MPESA_ENV === 'production'
+    ? 'https://api.safaricom.co.ke'
+    : 'https://sandbox.safaricom.co.ke';
+}
+
+function darajaConfigured() {
+  return Boolean(process.env.MPESA_CONSUMER_KEY && process.env.MPESA_CONSUMER_SECRET &&
+    process.env.MPESA_SHORTCODE && process.env.MPESA_PASSKEY);
+}
+
+const _tokenCache = { token: null, expiresAt: 0 };
+
+async function getAccessToken() {
+  if (_tokenCache.token && Date.now() < _tokenCache.expiresAt - 60000) return _tokenCache.token;
+  const key = process.env.MPESA_CONSUMER_KEY;
+  const secret = process.env.MPESA_CONSUMER_SECRET;
+  const creds = Buffer.from(key + ':' + secret).toString('base64');
+  let res;
+  try {
+    res = await fetch(darajaBaseUrl() + '/oauth/v1/generate?grant_type=client_credentials', {
+      headers: { Authorization: 'Basic ' + creds },
+    });
+  } catch (e) {
+    const err = new Error('daraja token request failed');
+    err.daraja = { errorMessage: String((e && e.message) || e) };
+    throw err;
+  }
+  let body = {};
+  try { body = await res.json(); } catch (e) { body = {}; }
+  if (!res.ok || !body.access_token) {
+    const err = new Error('daraja token request failed');
+    err.daraja = body;
+    err.status = res.status;
+    throw err;
+  }
+  const ttl = Number(body.expires_in);
+  _tokenCache.token = body.access_token;
+  _tokenCache.expiresAt = Date.now() + (isNaN(ttl) ? 3599 : Number(ttl)) * 1000;
+  return _tokenCache.token;
+}
+
+function darajaErrorPayload(body, res) {
+  const msg = (body && (body.errorMessage || body.ResponseDescription || body.error_description)) ||
+    ('Daraja request failed' + (res ? ' (HTTP ' + res.status + ')' : ''));
+  return { errorMessage: msg, detail: body };
+}
+
+app.post('/api/pay', async (req, res) => {
+  if (!darajaConfigured()) {
+    return res.status(501).json({ error: 'not-configured', hint: 'set Daraja env vars' });
+  }
+  const phone = normalizePhone(req.body && req.body.phone);
+  if (!phone) return res.status(400).json({ error: 'invalid-phone' });
+  const amount = Number(req.body && req.body.amount);
+  if (!Number.isInteger(amount) || amount < 1 || amount > 150000) {
+    return res.status(400).json({ error: 'invalid-amount' });
+  }
+  const shortcode = process.env.MPESA_SHORTCODE;
+  const passkey = process.env.MPESA_PASSKEY;
+  const stamp = stampNow();
+  const txType = process.env.MPESA_TYPE || 'CustomerPayBillOnline';
+  const callBackURL = process.env.PUBLIC_URL || 'https://confetti.spidmax.win/callback';
+  let token;
+  try {
+    token = await getAccessToken();
+  } catch (e) {
+    const d = (e && e.daraja) || {};
+    return res.status(502).json({ errorMessage: d.errorMessage || d.ResponseDescription || 'token request failed' });
+  }
+  let resp;
+  try {
+    resp = await fetch(darajaBaseUrl() + '/mpesa/stkpush/v1/processrequest', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        BusinessShortCode: shortcode,
+        Password: buildStkPassword(shortcode, passkey, stamp),
+        Timestamp: stamp,
+        TransactionType: txType,
+        Amount: amount,
+        PartyA: phone,
+        PartyB: shortcode,
+        PhoneNumber: phone,
+        CallBackURL: callBackURL,
+        AccountReference: 'mpesa-confetti',
+        TransactionDesc: 'payment',
+      }),
+    });
+  } catch (e) {
+    return res.status(502).json({ errorMessage: String((e && e.message) || e) });
+  }
+  let body = {};
+  try { body = await resp.json(); } catch (e) { body = {}; }
+  if (!resp.ok || String(body.ResponseCode) !== '0') {
+    const p = darajaErrorPayload(body, resp);
+    return res.status(502).json(p);
+  }
+  return res.json({ checkoutRequestID: body.CheckoutRequestID, customerMessage: body.CustomerMessage });
+});
+
+app.get('/api/pay/:checkoutRequestID', async (req, res) => {
+  if (!darajaConfigured()) {
+    return res.status(501).json({ error: 'not-configured', hint: 'set Daraja env vars' });
+  }
+  const shortcode = process.env.MPESA_SHORTCODE;
+  const passkey = process.env.MPESA_PASSKEY;
+  const stamp = stampNow();
+  let token;
+  try {
+    token = await getAccessToken();
+  } catch (e) {
+    const d = (e && e.daraja) || {};
+    return res.status(502).json({ errorMessage: d.errorMessage || d.ResponseDescription || 'token request failed' });
+  }
+  let resp;
+  try {
+    resp = await fetch(darajaBaseUrl() + '/mpesa/stkpushquery/v1/query', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        BusinessShortCode: shortcode,
+        CheckoutRequestID: req.params.checkoutRequestID,
+        Password: buildStkPassword(shortcode, passkey, stamp),
+        Timestamp: stamp,
+      }),
+    });
+  } catch (e) {
+    return res.status(502).json({ errorMessage: String((e && e.message) || e) });
+  }
+  let body = {};
+  try { body = await resp.json(); } catch (e) { body = {}; }
+  if (!resp.ok || String(body.ResponseCode) !== '0') {
+    const p = darajaErrorPayload(body, resp);
+    return res.status(502).json(p);
+  }
+  const rc = Number(body.ResultCode);
+  if (rc === 0) return res.json({ status: 'confirmed', resultCode: body.ResultCode, resultDesc: body.ResultDesc, raw: body });
+  if (rc === 1032 || rc === 1 || rc === 1037) return res.json({ status: 'pending', resultCode: body.ResultCode, resultDesc: body.ResultDesc });
+  return res.json({ status: 'failed', resultCode: body.ResultCode, resultDesc: body.ResultDesc });
+});
+
 // Simulator
 const NAMES = ['Wanjiku', 'Otieno', 'Achieng', 'Kamau', 'Njeri', 'Omondi',
   'Chebet', 'Kiprop', 'Mutiso', 'Akinyi', 'Njoroge', 'Wambui'];
@@ -156,16 +317,20 @@ function simulateOne() {
   });
 }
 
-if (process.env.SIMULATE !== 'false') {
-  (function loop() {
-    const delay = 6000 + Math.random() * 6000;
-    setTimeout(() => {
-      simulateOne();
-      loop();
-    }, delay);
-  })();
+if (require.main === module || !module.parent) {
+  if (process.env.SIMULATE !== 'false') {
+    (function loop() {
+      const delay = 6000 + Math.random() * 6000;
+      setTimeout(() => {
+        simulateOne();
+        loop();
+      }, delay);
+    })();
+  }
+
+  app.listen(PORT, () => {
+    console.log('mpesa-confetti listening on ' + PORT);
+  });
 }
 
-app.listen(PORT, () => {
-  console.log('mpesa-confetti listening on ' + PORT);
-});
+module.exports = { app, normalizePhone, buildStkPassword, stampNow, darajaBaseUrl, getAccessToken };

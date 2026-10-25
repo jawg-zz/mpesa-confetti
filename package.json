@@ -1,1 +1,1 @@
-{"dependencies":{"express":"^4.19.2"},"engines":{"node":">=18"},"main":"server.js","name":"mpesa-confetti","scripts":{"start":"node server.js"},"version":"1.0.0"}
+{"dependencies":{"express":"^4.19.2"},"engines":{"node":">=18"},"main":"server.js","name":"mpesa-confetti","scripts":{"start":"node server.js","test":"node --test test/daraja.test.js"},"version":"1.0.0"}

@@ -43,6 +43,15 @@
   #feed .amt { font-weight:700; }
   #feed .sub { font-size:.8rem; color:var(--muted); }
   #empty { color:var(--muted); }
+  #charge { margin-bottom:4px; }
+  #charge .row { display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; }
+  #charge input { flex:1; min-width:140px; padding:10px 12px; border:1px solid #cbd5e1; border-radius:8px; font-size:1rem; }
+  #chargeBtn { cursor:pointer; border:none; background:var(--green); color:#fff; border-radius:8px; padding:10px 18px; font-size:1rem; font-weight:700; }
+  #chargeBtn:hover:not(:disabled) { filter:brightness(1.05); }
+  #chargeBtn:disabled { opacity:.6; cursor:wait; }
+  #chargeStatus { margin-top:10px; font-size:.9rem; color:var(--muted); }
+  #chargeStatus.error { color:var(--red); }
+  #chargeStatus.ok { color:var(--green); }
 </style>
 </head>
 <body>
@@ -57,6 +66,15 @@
     <div class="card"><div class="label">Total (KES)</div><div class="value" id="statSum">0</div></div>
     <div class="card"><div class="label">Biggest payment</div><div class="value" id="statBiggest">—</div><small id="statBiggestBy"></small></div>
     <div class="card"><div class="label">Failed</div><div class="value" id="statFailed">0</div></div>
+  </section>
+  <section id="charge" class="card" aria-label="Charge via M-Pesa">
+    <div class="label">Charge via M-Pesa</div>
+    <div class="row">
+      <input id="chargePhone" inputmode="tel" autocomplete="tel" placeholder="0712 345 678">
+      <input id="chargeAmount" type="number" min="1" max="150000" placeholder="Amount (KES)">
+      <button id="chargeBtn" type="button">Charge</button>
+    </div>
+    <div id="chargeStatus" role="status" aria-live="polite"></div>
   </section>
   <div id="banner" role="status" aria-live="polite"></div>
   <h2>Recent payments</h2>
@@ -217,10 +235,13 @@
 
   function connect() {
     setConn('connecting');
-    var es = new EventSource('/events');
     es.addEventListener('payment', function (ev) {
       setConn('live');
-      try { handlePayment(JSON.parse(ev.data)); } catch (e) {}
+      try {
+        var p = JSON.parse(ev.data);
+        handlePayment(p);
+        resolvePendingCharge(p);
+      } catch (e) {}
     });
     es.onopen = function () { setConn('live'); };
     es.onerror = function () {
@@ -228,6 +249,97 @@
       if (es.readyState === EventSource.CLOSED) setConn('down');
       else setConn('down');
     };
+  }
+  // ---- Real STK-push Charge panel ----
+  var chargePhone = document.getElementById('chargePhone');
+  var chargeAmount = document.getElementById('chargeAmount');
+  var chargeBtn = document.getElementById('chargeBtn');
+  var chargeStatus = document.getElementById('chargeStatus');
+  var pendingCharge = null; // { checkoutRequestID, timer }
+  function setChargeStatus(msg, cls) {
+    chargeStatus.textContent = msg;
+    chargeStatus.className = cls || '';
+  }
+  function resolvePendingCharge(p) {
+    if (!pendingCharge || !p) return;
+    if (p.success) {
+      clearTimeout(pendingCharge.timer);
+      pendingCharge = null;
+      setChargeStatus('Payment confirmed — thank you! 🎉', 'ok');
+      chargeBtn.disabled = false;
+    } else if (p.transactionId === pendingCharge.checkoutRequestID ||
+        p.checkoutRequestID === pendingCharge.checkoutRequestID ||
+        p.errorMessage || p.resultDesc) {
+      clearTimeout(pendingCharge.timer);
+      pendingCharge = null;
+      setChargeStatus('Payment failed: ' + (p.errorMessage || p.resultDesc || 'request cancelled or failed.'), 'error');
+      chargeBtn.disabled = false;
+    }
+  }
+  function pollChargeStatus(id, left) {
+    if (!pendingCharge || pendingCharge.checkoutRequestID !== id) return;
+    if (left <= 0) return; // keep waiting on SSE; stop polling quietly
+    fetch('/api/pay/' + encodeURIComponent(id))
+      .then(function (r) { return r.json().catch(function () { return {}; }).then(function (b) { return { ok: r.ok, body: b }; }); })
+      .then(function (res) {
+        if (!pendingCharge || pendingCharge.checkoutRequestID !== id) return;
+        var b = res.body || {};
+        if (b.status === 'confirmed' || b.success === true) {
+          clearTimeout(pendingCharge.timer);
+          pendingCharge = null;
+          setChargeStatus('Payment confirmed — thank you! 🎉', 'ok');
+          chargeBtn.disabled = false;
+        } else if (b.status === 'failed' || b.success === false) {
+          clearTimeout(pendingCharge.timer);
+          pendingCharge = null;
+          setChargeStatus('Payment failed: ' + (b.errorMessage || b.resultDesc || 'request cancelled or failed.'), 'error');
+          chargeBtn.disabled = false;
+        } else {
+          pendingCharge.timer = setTimeout(function () { pollChargeStatus(id, left - 1); }, 5000);
+        }
+      })
+      .catch(function () {
+        if (pendingCharge && pendingCharge.checkoutRequestID === id) {
+          pendingCharge.timer = setTimeout(function () { pollChargeStatus(id, left - 1); }, 5000);
+        }
+      });
+  }
+  if (chargeBtn) {
+    chargeBtn.addEventListener('click', function () {
+      var phone = (chargePhone.value || '').trim();
+      var amount = Number(chargeAmount.value);
+      chargeBtn.disabled = true;
+      setChargeStatus('Sending STK push…', '');
+      fetch('/api/pay', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ phone: phone, amount: amount })
+      }).then(function (r) {
+        return r.json().catch(function () { return {}; }).then(function (b) { return { status: r.status, body: b }; });
+      }).then(function (res) {
+        var b = res.body || {};
+        if (res.status === 501) {
+          setChargeStatus('Setup mode: set Daraja env vars (MPESA_CONSUMER_KEY, MPESA_CONSUMER_SECRET, MPESA_SHORTCODE, MPESA_PASSKEY) to enable real charges.', 'error');
+          chargeBtn.disabled = false;
+        } else if (res.status === 400) {
+          setChargeStatus('Check details: ' + (b.error || 'invalid phone or amount.'), 'error');
+          chargeBtn.disabled = false;
+        } else if (res.status === 502 || b.errorMessage) {
+          setChargeStatus('M-Pesa error: ' + (b.errorMessage || 'STK push failed.'), 'error');
+          chargeBtn.disabled = false;
+        } else if (b.checkoutRequestID) {
+          setChargeStatus('Check ' + phone + ' — enter your M-Pesa PIN to pay KES ' + fmtKES(amount) + '…', 'ok');
+          pendingCharge = { checkoutRequestID: b.checkoutRequestID, timer: null };
+          pendingCharge.timer = setTimeout(function () { pollChargeStatus(b.checkoutRequestID, 5); }, 5000);
+        } else {
+          setChargeStatus('Unexpected response — please try again.', 'error');
+          chargeBtn.disabled = false;
+        }
+      }).catch(function () {
+        setChargeStatus('Network error — could not reach /api/pay.', 'error');
+        chargeBtn.disabled = false;
+      });
+    });
   }
 
   loadInitial();
