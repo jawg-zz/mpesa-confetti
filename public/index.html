@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>M-Pesa Confetti 🎉 — Live Payments</title>
+<script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.9.3/dist/confetti.browser.min.js"></script>
+<style>
+  :root { --green:#16a34a; --red:#dc2626; --bg:#f8fafc; --card:#fff; --ink:#0f172a; --muted:#64748b; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--ink); }
+  header { display:flex; align-items:center; gap:12px; padding:14px 20px; background:#0f172a; color:#fff; flex-wrap:wrap; }
+  header h1 { font-size:1.25rem; margin:0; flex:1; min-width:200px; }
+  #soundToggle { cursor:pointer; border:1px solid #334155; background:#1e293b; color:#fff; border-radius:8px; padding:8px 12px; font-size:1rem; }
+  #soundToggle:hover { background:#334155; }
+  #conn { display:flex; align-items:center; gap:6px; font-size:.85rem; color:#cbd5e1; }
+  #connDot { width:10px; height:10px; border-radius:50%; background:#f59e0b; display:inline-block; }
+  #connDot.live { background:#22c55e; }
+  #connDot.down { background:#ef4444; }
+  main { max-width:900px; margin:0 auto; padding:20px; }
+  #stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:12px; margin-bottom:16px; }
+  .card { background:var(--card); border-radius:12px; padding:14px 16px; box-shadow:0 1px 4px rgba(0,0,0,.08); }
+  .card .label { font-size:.75rem; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); }
+  .card .value { font-size:1.5rem; font-weight:700; margin-top:4px; }
+  .card small { color:var(--muted); display:block; font-size:.8rem; margin-top:2px; word-break:break-word; }
+  #banner { display:none; border-radius:12px; padding:16px 18px; margin-bottom:16px; color:#fff; font-size:1rem; }
+  #banner.show { display:block; }
+  #banner.success { background:var(--green); }
+  #banner.failed { background:var(--red); }
+  #banner.failed.show { animation:shake .5s; }
+  @keyframes shake {
+    0%,100% { transform:translateX(0); }
+    20% { transform:translateX(-10px); }
+    40% { transform:translateX(10px); }
+    60% { transform:translateX(-6px); }
+    80% { transform:translateX(6px); }
+  }
+  #banner .meta { font-size:.85rem; opacity:.9; margin-top:6px; }
+  h2 { font-size:1.1rem; margin:18px 0 10px; }
+  #feed { list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:8px; }
+  #feed li { background:var(--card); border-radius:10px; padding:10px 14px; box-shadow:0 1px 3px rgba(0,0,0,.06); display:flex; justify-content:space-between; gap:10px; flex-wrap:wrap; border-left:5px solid var(--green); }
+  #feed li.failed { border-left-color:var(--red); background:#fef2f2; }
+  #feed .amt { font-weight:700; }
+  #feed .sub { font-size:.8rem; color:var(--muted); }
+  #empty { color:var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>🎉 M-Pesa Confetti — Live Payments</h1>
+  <button id="soundToggle" aria-pressed="true" title="Toggle sound">🔊 Sound on</button>
+  <span id="conn"><span id="connDot"></span><span id="connText">Connecting…</span></span>
+</header>
+<main>
+  <section id="stats" aria-label="Today's stats">
+    <div class="card"><div class="label">Today's count</div><div class="value" id="statCount">0</div></div>
+    <div class="card"><div class="label">Total (KES)</div><div class="value" id="statSum">0</div></div>
+    <div class="card"><div class="label">Biggest payment</div><div class="value" id="statBiggest">—</div><small id="statBiggestBy"></small></div>
+    <div class="card"><div class="label">Failed</div><div class="value" id="statFailed">0</div></div>
+  </section>
+  <div id="banner" role="status" aria-live="polite"></div>
+  <h2>Recent payments</h2>
+  <ul id="feed"></ul>
+  <p id="empty">No payments yet — waiting for the first M-Pesa ping…</p>
+</main>
+<script>
+(function () {
+  var soundBtn = document.getElementById('soundToggle');
+  var connDot = document.getElementById('connDot');
+  var connText = document.getElementById('connText');
+  var banner = document.getElementById('banner');
+  var feed = document.getElementById('feed');
+  var empty = document.getElementById('empty');
+  var elCount = document.getElementById('statCount');
+  var elSum = document.getElementById('statSum');
+  var elBig = document.getElementById('statBiggest');
+  var elBigBy = document.getElementById('statBiggestBy');
+  var elFailed = document.getElementById('statFailed');
+
+  var soundOn = true;
+  try { soundOn = localStorage.getItem('mpesa-sound') !== 'off'; } catch (e) {}
+  var audioCtx = null;
+
+  function renderSoundBtn() {
+    soundBtn.textContent = soundOn ? '🔊 Sound on' : '🔇 Sound off';
+    soundBtn.setAttribute('aria-pressed', String(soundOn));
+  }
+  soundBtn.addEventListener('click', function () {
+    soundOn = !soundOn;
+    try { localStorage.setItem('mpesa-sound', soundOn ? 'on' : 'off'); } catch (e) {}
+    renderSoundBtn();
+    if (soundOn) chaChing();
+  });
+  renderSoundBtn();
+
+  function chaChing() {
+    if (!soundOn) return;
+    try {
+      var AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return;
+      if (!audioCtx) audioCtx = new AC();
+      if (audioCtx.state === 'suspended') audioCtx.resume();
+      var t0 = audioCtx.currentTime;
+      [[880, 0], [1320, 0.15]].forEach(function (pair) {
+        var osc = audioCtx.createOscillator();
+        var gain = audioCtx.createGain();
+        osc.type = 'sine';
+        osc.frequency.value = pair[0];
+        gain.gain.setValueAtTime(0.0001, t0 + pair[1]);
+        gain.gain.exponentialRampToValueAtTime(0.5, t0 + pair[1] + 0.02);
+        gain.gain.exponentialRampToValueAtTime(0.0001, t0 + pair[1] + 0.15);
+        osc.connect(gain).connect(audioCtx.destination);
+        osc.start(t0 + pair[1]);
+        osc.stop(t0 + pair[1] + 0.16);
+      });
+    } catch (e) {}
+  }
+
+  function fmtKES(n) { return Number(n || 0).toLocaleString('en-KE'); }
+  function fmtTime(iso) {
+    try { return new Date(iso).toLocaleString(); } catch (e) { return iso || ''; }
+  }
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+      return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c];
+    });
+  }
+
+  function renderStats(s) {
+    elCount.textContent = s.count || 0;
+    elSum.textContent = fmtKES(s.sum);
+    elFailed.textContent = s.failed || 0;
+    if (s.biggest) {
+      elBig.textContent = 'KES ' + fmtKES(s.biggest.amount);
+      elBigBy.textContent = (s.biggest.payer || '') + ' · ' + (s.biggest.transactionId || '');
+    } else {
+      elBig.textContent = '—';
+      elBigBy.textContent = '';
+    }
+  }
+
+  function feedItem(p) {
+    var li = document.createElement('li');
+    if (!p.success) li.className = 'failed';
+    li.innerHTML =
+      '<div><div><strong>' + esc(p.payer) + '</strong> · <span class="amt">KES ' + fmtKES(p.amount) + '</span></div>' +
+      '<div class="sub">' + esc(p.phone || '') + ' · ' + esc(fmtTime(p.time)) + '</div></div>' +
+      '<div class="sub">' + esc(p.transactionId || '') + (p.success ? '' : ' · FAILED') + '</div>';
+    return li;
+  }
+
+  function refreshStats() {
+    fetch('/api/stats').then(function (r) { return r.json(); }).then(renderStats).catch(function () {});
+  }
+
+  function loadInitial() {
+    fetch('/api/stats').then(function (r) { return r.json(); }).then(renderStats).catch(function () {});
+    fetch('/api/payments?limit=20').then(function (r) { return r.json(); }).then(function (arr) {
+      feed.innerHTML = '';
+      if (Array.isArray(arr) && arr.length) {
+        empty.style.display = 'none';
+        arr.forEach(function (p) { feed.appendChild(feedItem(p)); });
+      } else {
+        empty.style.display = '';
+      }
+    }).catch(function () {});
+  }
+
+  var bannerTimer = null;
+  function showBanner(p) {
+    banner.classList.remove('show', 'success', 'failed');
+    // Force reflow so shake animation replays on consecutive failures
+    void banner.offsetWidth;
+    if (p.success) {
+      banner.className = 'show success';
+      banner.innerHTML = '🎉 <strong>' + esc(p.payer) + '</strong> paid <strong>KES ' + fmtKES(p.amount) + '</strong>' +
+        '<div class="meta">' + esc(p.phone || '') + ' · ' + esc(fmtTime(p.time)) + ' · ' + esc(p.transactionId || '') + '</div>';
+    } else {
+      banner.className = 'show failed';
+      banner.innerHTML = '❌ Payment failed — <strong>' + esc(p.payer || 'Unknown') + '</strong>' +
+        (p.amount ? ' (KES ' + fmtKES(p.amount) + ')' : '') +
+        '<div class="meta">' + esc(p.phone || '') + ' · ' + esc(p.transactionId || '') + '</div>';
+    }
+    if (bannerTimer) clearTimeout(bannerTimer);
+    bannerTimer = setTimeout(function () { banner.classList.remove('show'); }, 8000);
+  }
+
+  function confettiExplosion() {
+    if (typeof confetti !== 'function') return;
+    var end = Date.now() + 2500;
+    confetti({ particleCount: 120, spread: 100, origin: { y: 0.6 } });
+    (function frame() {
+      confetti({ particleCount: 3, angle: 60, spread: 60, origin: { x: 0 } });
+      confetti({ particleCount: 3, angle: 120, spread: 60, origin: { x: 1 } });
+      if (Date.now() < end) requestAnimationFrame(frame);
+    })();
+  }
+
+  function handlePayment(p) {
+    showBanner(p);
+    empty.style.display = 'none';
+    feed.insertBefore(feedItem(p), feed.firstChild);
+    while (feed.children.length > 20) feed.removeChild(feed.lastChild);
+    if (p.success) {
+      confettiExplosion();
+      chaChing();
+    }
+    refreshStats();
+  }
+
+  function setConn(state) {
+    connDot.className = '';
+    if (state === 'live') { connDot.classList.add('live'); connText.textContent = 'Live'; }
+    else if (state === 'down') { connDot.classList.add('down'); connText.textContent = 'Reconnecting…'; }
+    else { connText.textContent = 'Connecting…'; }
+  }
+
+  function connect() {
+    setConn('connecting');
+    var es = new EventSource('/events');
+    es.addEventListener('payment', function (ev) {
+      setConn('live');
+      try { handlePayment(JSON.parse(ev.data)); } catch (e) {}
+    });
+    es.onopen = function () { setConn('live'); };
+    es.onerror = function () {
+      // EventSource natively retries; surface status only, don't manual-reconnect loop.
+      if (es.readyState === EventSource.CLOSED) setConn('down');
+      else setConn('down');
+    };
+  }
+
+  loadInitial();
+  connect();
+})();
+</script>
+</body>
+</html>
