@@ -136,7 +136,8 @@
 
   function fmtKES(n) { return Number(n || 0).toLocaleString('en-KE'); }
   function fmtTime(iso) {
-    try { return new Date(iso).toLocaleString(); } catch (e) { return iso || ''; }
+    // new Date(bad) yields "Invalid Date" (no throw), so guard explicitly.
+    try { var d = new Date(iso); return isNaN(d.getTime()) ? (iso || '') : d.toLocaleString(); } catch (e) { return iso || ''; }
   }
   function esc(s) {
     return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
@@ -235,6 +236,10 @@
 
   function connect() {
     setConn('connecting');
+    if (typeof EventSource === 'undefined') { setConn('down'); return; }
+    // BUG WAS HERE: listeners referenced a bare `es` that was never created,
+    // so connect() threw ReferenceError and the live feed never started.
+    var es = new EventSource('/events');
     es.addEventListener('payment', function (ev) {
       setConn('live');
       try {
@@ -246,8 +251,7 @@
     es.onopen = function () { setConn('live'); };
     es.onerror = function () {
       // EventSource natively retries; surface status only, don't manual-reconnect loop.
-      if (es.readyState === EventSource.CLOSED) setConn('down');
-      else setConn('down');
+      setConn('down');
     };
   }
   // ---- Real STK-push Charge panel ----
@@ -262,19 +266,19 @@
   }
   function resolvePendingCharge(p) {
     if (!pendingCharge || !p) return;
+    // Only the matching checkout may settle this charge. Confirming on ANY
+    // success payment (the old behaviour) marked the user paid whenever a
+    // stranger paid; unmatched events are just feed traffic for polling to own.
+    var id = p.transactionId || p.checkoutRequestID;
+    if (id !== pendingCharge.checkoutRequestID) return;
+    clearTimeout(pendingCharge.timer);
+    pendingCharge = null;
     if (p.success) {
-      clearTimeout(pendingCharge.timer);
-      pendingCharge = null;
       setChargeStatus('Payment confirmed — thank you! 🎉', 'ok');
-      chargeBtn.disabled = false;
-    } else if (p.transactionId === pendingCharge.checkoutRequestID ||
-        p.checkoutRequestID === pendingCharge.checkoutRequestID ||
-        p.errorMessage || p.resultDesc) {
-      clearTimeout(pendingCharge.timer);
-      pendingCharge = null;
+    } else {
       setChargeStatus('Payment failed: ' + (p.errorMessage || p.resultDesc || 'request cancelled or failed.'), 'error');
-      chargeBtn.disabled = false;
     }
+    chargeBtn.disabled = false;
   }
   function pollChargeStatus(id, left) {
     if (!pendingCharge || pendingCharge.checkoutRequestID !== id) return;

@@ -11,9 +11,10 @@ const payments = [];
 const clients = new Set();
 
 function maskPhone(raw) {
+  // NOTE: non-digits are stripped first, so a '+254' prefix can never survive
+  // to this point (the old else-if for it was dead code). '254…' → '0…'.
   let s = String(raw == null ? '' : raw).replace(/\D/g, '');
   if (s.startsWith('254')) s = '0' + s.slice(3);
-  else if (s.startsWith('+254')) s = '0' + s.slice(4);
   if (s.length < 7) return s;
   return s.slice(0, 4) + '***' + s.slice(-3);
 }
@@ -26,21 +27,41 @@ function parseTransactionDate(v) {
     const d = new Date(String(v));
     return isNaN(d.getTime()) ? new Date().toISOString() : d.toISOString();
   }
-  const d = new Date(
-    Number(m[1]), Number(m[2]) - 1, Number(m[3]),
-    Number(m[4]), Number(m[5]), Number(m[6])
-  );
-  return isNaN(d.getTime()) ? new Date().toISOString() : d.toISOString();
+  const Y = Number(m[1]), Mo = Number(m[2]), D = Number(m[3]);
+  const H = Number(m[4]), Mi = Number(m[5]), S = Number(m[6]);
+  // Daraja stamps are Africa/Nairobi wall-clock (UTC+3, no DST). Reject
+  // out-of-range components instead of letting Date normalize the rollover
+  // (e.g. month 13 silently becoming January of the next year).
+  if (Mo < 1 || Mo > 12 || D < 1 || D > 31 || H > 23 || Mi > 59 || S > 59) {
+    return new Date().toISOString();
+  }
+  const ms = Date.UTC(Y, Mo - 1, D, H, Mi, S) - 3 * 3600 * 1000;
+  // Round-trip in EAT terms to catch invalid day-of-month (e.g. Feb 30).
+  const e = new Date(ms + 3 * 3600 * 1000);
+  if (e.getUTCFullYear() !== Y || e.getUTCMonth() !== Mo - 1 || e.getUTCDate() !== D ||
+    e.getUTCHours() !== H || e.getUTCMinutes() !== Mi || e.getUTCSeconds() !== S) {
+    return new Date().toISOString();
+  }
+  return new Date(ms).toISOString();
 }
 
 function addPayment(p) {
   payments.push(p);
   if (payments.length > 100) payments.splice(0, payments.length - 100);
   const data = JSON.stringify(p);
-  for (const res of clients) {
+  // Dead clients must be dropped here: a 'close' event can race a broadcast,
+  // and an async socket error after res.write would otherwise throw
+  // unhandled (ERR_UNHANDLED_ERROR) and leak the entry forever.
+  for (const client of [...clients]) {
+    if (client.destroyed || client.writableEnded) {
+      clients.delete(client);
+      continue;
+    }
     try {
-      res.write(`event: payment\ndata: ${data}\n\n`);
-    } catch (e) { /* ignore */ }
+      client.write(`event: payment\ndata: ${data}\n\n`);
+    } catch (e) {
+      clients.delete(client);
+    }
   }
   return p;
 }
@@ -56,10 +77,14 @@ app.get('/events', (req, res) => {
   const keepalive = setInterval(() => {
     try { res.write(': ping\n\n'); } catch (e) { /* ignore */ }
   }, 25000);
-  req.on('close', () => {
+  const cleanup = () => {
     clearInterval(keepalive);
     clients.delete(res);
-  });
+  };
+  // 'error' must be observed: without a listener a post-close socket failure
+  // crashes the process instead of just ending this stream.
+  res.on('error', cleanup);
+  req.on('close', cleanup);
 });
 
 app.post('/callback', (req, res) => {
@@ -67,7 +92,8 @@ app.post('/callback', (req, res) => {
     const cb = req.body && req.body.Body && req.body.Body.stkCallback;
     if (cb) {
       const success = Number(cb.ResultCode) === 0;
-      const items = ((cb.CallbackMetadata && cb.CallbackMetadata.Item) || []);
+      const rawItems = (cb.CallbackMetadata && cb.CallbackMetadata.Item) || [];
+      const items = Array.isArray(rawItems) ? rawItems : [];
       const meta = {};
       for (const it of items) {
         if (it && it.Name != null) meta[it.Name] = it.Value;
@@ -91,12 +117,17 @@ app.post('/callback', (req, res) => {
   res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
 });
 
+function nairobiDayKey(d) {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Africa/Nairobi', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).format(d);
+}
 function isToday(iso) {
+  // M-Pesa money moves on Nairobi wall-clock days. Comparing server-local
+  // calendar days misattributes payments whenever TZ != Africa/Nairobi.
   const d = new Date(iso);
-  const now = new Date();
-  return d.getFullYear() === now.getFullYear() &&
-    d.getMonth() === now.getMonth() &&
-    d.getDate() === now.getDate();
+  if (isNaN(d.getTime())) return false;
+  return nairobiDayKey(d) === nairobiDayKey(new Date());
 }
 
 app.get('/api/stats', (req, res) => {
@@ -106,7 +137,9 @@ app.get('/api/stats', (req, res) => {
   const sum = ok.reduce((a, p) => a + (Number(p.amount) || 0), 0);
   let biggest = null;
   for (const p of ok) {
-    if (!biggest || p.amount > biggest.amount) {
+    // Compare numerically: string amounts compare lexicographically
+    // ('500' > '1000'), electing the wrong "biggest" payment.
+    if (!biggest || Number(p.amount) > Number(biggest.amount)) {
       biggest = { amount: p.amount, payer: p.payer, transactionId: p.transactionId };
     }
   }
@@ -114,14 +147,22 @@ app.get('/api/stats', (req, res) => {
 });
 
 app.get('/api/payments', (req, res) => {
-  let limit = parseInt(req.query.limit, 10);
-  if (isNaN(limit) || limit <= 0) limit = 20;
+  const rawLimit = req.query.limit;
+  // Strict Number(): parseInt('20abc') silently returned 20 and there was no
+  // upper bound, so ?limit=9999999999 forced a maximal scan every request.
+  let limit = (typeof rawLimit === 'string' || typeof rawLimit === 'number') ? Number(rawLimit) : NaN;
+  if (!Number.isInteger(limit) || limit <= 0) limit = 20;
+  limit = Math.min(limit, 100);
   res.json(payments.slice(-limit).reverse());
 });
 
 // Daraja (Safaricom) STK-push
 function normalizePhone(raw) {
-  let s = String(raw == null ? '' : raw).replace(/\D/g, '');
+  const input = String(raw == null ? '' : raw);
+  // Reject anything outside a plain phone shape instead of silently stripping
+  // letters and accepting the residue (e.g. '07ab12cd5678' must not verify).
+  if (/[^0-9+\s\-().]/.test(input)) return null;
+  const s = input.replace(/\D/g, '');
   if (s.length === 10 && (s.startsWith('07') || s.startsWith('01'))) return '254' + s.slice(1);
   if (s.length === 12 && s.startsWith('254') && (s[3] === '7' || s[3] === '1')) return s;
   if (s.length === 9 && (s[0] === '7' || s[0] === '1')) return '254' + s;
@@ -155,6 +196,11 @@ async function getAccessToken() {
   if (_tokenCache.token && Date.now() < _tokenCache.expiresAt - 60000) return _tokenCache.token;
   const key = process.env.MPESA_CONSUMER_KEY;
   const secret = process.env.MPESA_CONSUMER_SECRET;
+  if (!key || !secret) {
+    const err = new Error('daraja token request failed');
+    err.daraja = { errorMessage: 'not-configured' };
+    throw err;
+  }
   const creds = Buffer.from(key + ':' + secret).toString('base64');
   let res;
   try {
@@ -174,9 +220,13 @@ async function getAccessToken() {
     err.status = res.status;
     throw err;
   }
+  // expires_in is authoritative. The old `isNaN(ttl) ? 3599 : Number(ttl)`
+  // cached 0/negative/garbage ttls as already-expired entries (fetch thrash)
+  // and cached Infinity forever (stale token reuse).
   const ttl = Number(body.expires_in);
+  const ttlSafe = (Number.isFinite(ttl) && ttl > 0) ? ttl : 3599;
   _tokenCache.token = body.access_token;
-  _tokenCache.expiresAt = Date.now() + (isNaN(ttl) ? 3599 : Number(ttl)) * 1000;
+  _tokenCache.expiresAt = Date.now() + ttlSafe * 1000;
   return _tokenCache.token;
 }
 
@@ -206,7 +256,7 @@ app.post('/api/pay', async (req, res) => {
     token = await getAccessToken();
   } catch (e) {
     const d = (e && e.daraja) || {};
-    return res.status(502).json({ errorMessage: d.errorMessage || d.ResponseDescription || 'token request failed' });
+    return res.status(502).json({ errorMessage: d.errorMessage || d.ResponseDescription || d.error_description || 'token request failed' });
   }
   let resp;
   try {
@@ -243,6 +293,12 @@ app.get('/api/pay/:checkoutRequestID', async (req, res) => {
   if (!darajaConfigured()) {
     return res.status(501).json({ error: 'not-configured', hint: 'set Daraja env vars' });
   }
+  // The ID is forwarded to Daraja verbatim; reject empty/absurd values here
+  // instead of proxying junk (or a multi-MB path) upstream.
+  const checkoutRequestID = String(req.params.checkoutRequestID || '');
+  if (!checkoutRequestID || checkoutRequestID.length > 200) {
+    return res.status(400).json({ error: 'invalid-checkoutRequestID' });
+  }
   const shortcode = process.env.MPESA_SHORTCODE;
   const passkey = process.env.MPESA_PASSKEY;
   const stamp = stampNow();
@@ -251,7 +307,7 @@ app.get('/api/pay/:checkoutRequestID', async (req, res) => {
     token = await getAccessToken();
   } catch (e) {
     const d = (e && e.daraja) || {};
-    return res.status(502).json({ errorMessage: d.errorMessage || d.ResponseDescription || 'token request failed' });
+    return res.status(502).json({ errorMessage: d.errorMessage || d.ResponseDescription || d.error_description || 'token request failed' });
   }
   let resp;
   try {
@@ -260,7 +316,7 @@ app.get('/api/pay/:checkoutRequestID', async (req, res) => {
       headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         BusinessShortCode: shortcode,
-        CheckoutRequestID: req.params.checkoutRequestID,
+        CheckoutRequestID: checkoutRequestID,
         Password: buildStkPassword(shortcode, passkey, stamp),
         Timestamp: stamp,
       }),
@@ -333,4 +389,4 @@ if (require.main === module || !module.parent) {
   });
 }
 
-module.exports = { app, normalizePhone, buildStkPassword, stampNow, darajaBaseUrl, getAccessToken };
+module.exports = { app, normalizePhone, buildStkPassword, stampNow, darajaBaseUrl, getAccessToken, maskPhone, parseTransactionDate, isToday, addPayment, clients, _tokenCache };
