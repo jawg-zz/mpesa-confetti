@@ -61,3 +61,41 @@ describe('content-encoding handling', () => {
     assert.equal(j.error, 'unsupported-content-encoding');
   });
 });
+
+describe('Daraja callback URL construction', () => {
+  it('appends /callback to a bare PUBLIC_URL base', async () => {
+    // Set a bare base URL (as the README instructs) and capture the STK body.
+    process.env.PUBLIC_URL = 'https://confetti.spidmax.win';
+    process.env.MPESA_CONSUMER_KEY = 'k';
+    process.env.MPESA_CONSUMER_SECRET = 's';
+    process.env.MPESA_SHORTCODE = '174379';
+    process.env.MPESA_PASSKEY = 'p';
+    const orig = globalThis.fetch;
+    let sentBody;
+    globalThis.fetch = async (url, opts) => {
+      if (String(url).includes('processrequest')) {
+        sentBody = JSON.parse(opts.body);
+        return { ok: true, status: 200, json: async () => ({ ResponseCode: '0', CheckoutRequestID: 'cburl-test', CustomerMessage: 'ok' }) };
+      }
+      return { ok: true, status: 200, json: async () => ({ access_token: 'x', expires_in: 3600 }) };
+    };
+    try {
+      // Use the ORIGINAL fetch for the local request; the stub is only for
+      // the server's outbound Daraja calls.
+      const res = await orig(base + '/api/pay', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ phone: '0712345678', amount: 100 }),
+      });
+      assert.equal(res.status, 200);
+      assert.equal(sentBody.CallBackURL, 'https://confetti.spidmax.win/callback',
+        'Daraja must POST to /callback, not the site root');
+    } finally {
+      globalThis.fetch = orig;
+      delete process.env.PUBLIC_URL;
+      delete process.env.MPESA_CONSUMER_KEY;
+      delete process.env.MPESA_CONSUMER_SECRET;
+      delete process.env.MPESA_SHORTCODE;
+      delete process.env.MPESA_PASSKEY;
+    }
+  });
+});

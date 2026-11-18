@@ -279,7 +279,14 @@ app.post('/api/pay', async (req, res) => {
   const passkey = process.env.MPESA_PASSKEY;
   const stamp = stampNow();
   const txType = process.env.MPESA_TYPE || 'CustomerPayBillOnline';
-  const callBackURL = process.env.PUBLIC_URL || 'https://confetti.spidmax.win/callback';
+  // Daraja POSTs the payment result here. PUBLIC_URL is documented as the
+  // site BASE (e.g. https://confetti.spidmax.win), so always resolve it to
+  // the /callback endpoint; never hand Daraja a bare root URL (404 = lost
+  // payments). Accept a full /callback URL too for backward compatibility.
+  const publicBase = (process.env.PUBLIC_URL || 'https://confetti.spidmax.win').replace(/\/+$/, '');
+  const callBackURL = /\/callback\/?$/i.test(publicBase)
+    ? publicBase
+    : publicBase + '/callback';
   let token;
   try {
     token = await getAccessToken();
