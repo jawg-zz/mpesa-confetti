@@ -4,6 +4,35 @@ const path = require('path');
 const app = express();
 const PORT = process.env.PORT || 4100;
 
+// body-parser (express.json) decodes gzip/deflate but rejects Brotli with a
+// 415. Decode `br` up front when the body-parser version in use does not, so
+// compressed callbacks do not fail or spew a stack trace into the logs.
+const zlib = require('zlib');
+app.use((req, res, next) => {
+  if (String(req.headers['content-encoding'] || '').toLowerCase() !== 'br') return next();
+  // body-parser >= 2 handles br natively; don't double-decode.
+  let major = 0;
+  try { major = Number(require('body-parser/package.json').version.split('.')[0]); } catch (e) { /* unknown */ }
+  if (major >= 2) return next();
+  const chunks = [];
+  let size = 0;
+  req.on('data', (c) => {
+    size += c.length;
+    if (size > 1024 * 1024) { req.destroy(); return; }
+    chunks.push(c);
+  });
+  req.on('end', () => {
+    try {
+      const raw = zlib.brotliDecompressSync(Buffer.concat(chunks)).toString('utf8');
+      req.body = raw.length ? JSON.parse(raw) : {};
+      req._body = true; // tell body-parser this body is already consumed+parsed
+      next();
+    } catch (e) {
+      res.status(400).json({ error: 'invalid-brotli-body' });
+    }
+  });
+  req.on('error', () => { if (!res.headersSent) res.status(400).json({ error: 'invalid-brotli-body' }); });
+});
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -372,6 +401,25 @@ function simulateOne() {
     success,
   });
 }
+
+// Keep malformed/unsupported request bodies from reaching Express's default
+// HTML error page (which logs a full stack trace). Respond with a small JSON
+// error and only log a one-line summary.
+app.use((err, req, res, next) => { // eslint-disable-line no-unused-vars
+  if (res.headersSent) return next(err);
+  const code = err && err.status >= 400 && err.status < 500 ? err.status : 400;
+  if (err && err.type === 'encoding.unsupported') {
+    return res.status(415).json({ error: 'unsupported-content-encoding' });
+  }
+  if (err && err.type === 'entity.parse.failed') {
+    return res.status(400).json({ error: 'invalid-json-body' });
+  }
+  if (err && err.type === 'entity.too.large') {
+    return res.status(413).json({ error: 'body-too-large' });
+  }
+  console.error('request error:', (err && err.message) || 'unknown');
+  return res.status(code).json({ error: 'bad-request' });
+});
 
 if (require.main === module || !module.parent) {
   if (process.env.SIMULATE !== 'false') {
