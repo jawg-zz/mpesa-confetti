@@ -1,6 +1,23 @@
 # mpesa-confetti 🎉
 Merchant dashboard that visualizes M-Pesa payments: confetti explosion per payment, payer name, amount, time, transaction ID. Live feed via SSE + Daraja-compatible webhook.
 
+
+## Lago gateway mode (default when configured)
+
+The dashboard can charge through the Lago + M-Pesa gateway instead of talking to
+Safaricom Daraja directly. Set `LAGO_API_KEY` (server-side only) and optionally
+`LAGO_URL` (default `https://lago-pay.spidmax.win`). When `LAGO_API_KEY` is set,
+`/api/pay` creates a Lago customer, one-off add-on and invoice, then calls
+`/payment_url` — Lago sends the STK push. `/api/pay/:id` polls Lago invoice
+settlement and drives the confetti feed. No PSP secret or callback registration
+is needed in this app.
+
+- `PAYMENT_BACKEND=gateway|daraja` forces a backend (default: gateway when
+  `LAGO_API_KEY` is set, otherwise legacy Daraja).
+- `LAGO_ADD_ON_CODE` overrides the one-off add-on code (default `confetti-payment`).
+- Amounts from the UI are whole KES; the app converts to minor units for Lago.
+- The legacy `/callback` Daraja webhook remains for in-flight/rollback payments.
+
 ## Quickstart
 
 ```bash

@@ -1,5 +1,16 @@
 const express = require('express');
 const path = require('path');
+const gateway = require('./gateway.js');
+
+// Backend switch: gateway is used when a Lago API key is configured.
+// PAYMENT_BACKEND=daraja|gateway forces one explicitly (daraja = legacy/rollback).
+function useGateway() {
+  const forced = String(process.env.PAYMENT_BACKEND || '').toLowerCase();
+  if (forced === 'gateway') return true;
+  if (forced === 'daraja') return false;
+  return gateway.configured();
+}
+const pendingGatewayCharges = new Map(); // invoiceId -> { phone, amount }
 
 const app = express();
 const PORT = process.env.PORT || 4100;
@@ -38,6 +49,8 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 const payments = [];
 const clients = new Set();
+
+function phoneToExternalId(phone) { return 'confetti-' + phone; }
 
 function maskPhone(raw) {
   // NOTE: non-digits are stripped first, so a '+254' prefix can never survive
@@ -266,15 +279,42 @@ function darajaErrorPayload(body, res) {
 }
 
 app.post('/api/pay', async (req, res) => {
-  if (!darajaConfigured()) {
-    return res.status(501).json({ error: 'not-configured', hint: 'set Daraja env vars' });
-  }
   const phone = normalizePhone(req.body && req.body.phone);
-  if (!phone) return res.status(400).json({ error: 'invalid-phone' });
   const amount = Number(req.body && req.body.amount);
+
+  // Both backends share the same input contract.
+  if (!phone) return res.status(400).json({ error: 'invalid-phone' });
   if (!Number.isInteger(amount) || amount < 1 || amount > 150000) {
     return res.status(400).json({ error: 'invalid-amount' });
   }
+
+  if (useGateway()) {
+    try {
+      await gateway.ensureCustomer(phone);
+      await gateway.ensureAddOn();
+      // App sends whole KES; Lago expects minor units. The gateway requires
+      // whole-KES amounts for STK, so multiply by 100 exactly.
+      const invoice = await gateway.createInvoice(phoneToExternalId(phone), amount * 100);
+      const details = await gateway.requestPayment(invoice.lago_id);
+      pendingGatewayCharges.set(invoice.lago_id, { phone, amount, createdAt: Date.now() });
+      return res.json({
+        checkoutRequestID: invoice.lago_id,
+        customerMessage: 'STK push sent via Lago gateway',
+        paymentUrl: details.payment_url || null,
+      });
+    } catch (e) {
+      const g = (e && e.gateway) || {};
+      if (g.status === 400 || g.status === 422) {
+        return res.status(400).json({ error: 'gateway-validation', errorMessage: g.errorMessage });
+      }
+      return res.status(502).json({ errorMessage: g.errorMessage || String((e && e.message) || e) });
+    }
+  }
+
+  if (!darajaConfigured()) {
+    return res.status(501).json({ error: 'not-configured', hint: 'set Daraja env vars' });
+  }
+  // phone and amount were validated above for both backends.
   const shortcode = process.env.MPESA_SHORTCODE;
   const passkey = process.env.MPESA_PASSKEY;
   const stamp = stampNow();
@@ -326,6 +366,53 @@ app.post('/api/pay', async (req, res) => {
 });
 
 app.get('/api/pay/:checkoutRequestID', async (req, res) => {
+  const chargeKey = String(req.params.checkoutRequestID || '');
+
+  if (useGateway()) {
+    if (!chargeKey || chargeKey.length > 200) {
+      return res.status(400).json({ error: 'invalid-checkoutRequestID' });
+    }
+    const local = pendingGatewayCharges.get(chargeKey);
+    try {
+      const invoice = await gateway.getInvoice(chargeKey);
+      const status = String(invoice.payment_status || 'pending');
+      if (status === 'succeeded' || status === 'paid') {
+        if (local) {
+          const masked = maskPhone(local.phone);
+          addPayment({
+            payer: 'M-Pesa ' + masked,
+            amount: local.amount,
+            phone: masked,
+            time: new Date().toISOString(),
+            transactionId: chargeKey,
+            success: true,
+          });
+          pendingGatewayCharges.delete(chargeKey);
+        }
+        return res.json({ status: 'confirmed', resultDesc: 'paid', transactionId: chargeKey });
+      }
+      if (status === 'failed') {
+        if (local) {
+          addPayment({
+            payer: 'M-Pesa ' + maskPhone(local.phone),
+            amount: local.amount,
+            phone: maskPhone(local.phone),
+            time: new Date().toISOString(),
+            transactionId: chargeKey,
+            success: false,
+            errorMessage: 'payment failed',
+          });
+          pendingGatewayCharges.delete(chargeKey);
+        }
+        return res.json({ status: 'failed', resultDesc: 'payment failed' });
+      }
+      return res.json({ status: 'pending' });
+    } catch (e) {
+      const g = (e && e.gateway) || {};
+      return res.status(502).json({ errorMessage: g.errorMessage || String((e && e.message) || e) });
+    }
+  }
+
   if (!darajaConfigured()) {
     return res.status(501).json({ error: 'not-configured', hint: 'set Daraja env vars' });
   }

@@ -323,7 +323,7 @@
       }).then(function (res) {
         var b = res.body || {};
         if (res.status === 501) {
-          setChargeStatus('Setup mode: set Daraja env vars (MPESA_CONSUMER_KEY, MPESA_CONSUMER_SECRET, MPESA_SHORTCODE, MPESA_PASSKEY) to enable real charges.', 'error');
+          setChargeStatus('Setup mode: set LAGO_API_KEY to enable charges via the Lago gateway.', 'error');
           chargeBtn.disabled = false;
         } else if (res.status === 400) {
           setChargeStatus('Check details: ' + (b.error || 'invalid phone or amount.'), 'error');
