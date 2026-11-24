@@ -31,7 +31,10 @@ before(async () => {
     if (u.endsWith('/api/v1/customers') && (!opts || opts.method !== 'POST')) {
       return lagoResp({ customer: { external_id: 'confetti-254712345678' } });
     }
-    if (u.endsWith('/api/v1/customers')) return lagoResp({ customer: { lago_id: 'c1' } });
+    if (u.endsWith('/api/v1/customers')) {
+      const sent = JSON.parse(opts.body).customer;
+      return lagoResp({ customer: { lago_id: 'c1', external_id: sent.external_id } });
+    }
     if (u.endsWith('/api/v1/add_ons')) return lagoResp({ add_on: { code: 'confetti-payment' } });
     if (u.endsWith('/api/v1/invoices') && (!opts || opts.method !== 'POST')) {
       return lagoResp({ invoice: { lago_id: 'inv-1' } });
@@ -99,5 +102,45 @@ describe('gateway-backed charges', () => {
     assert.equal(r.status, 400);
     assert.equal((await r.json()).error, 'invalid-phone');
     assert.equal(calls.length, 0, 'no gateway calls on invalid input');
+  });
+
+  it('card rail creates a Paystack customer and returns a checkout URL', async () => {
+    calls.length = 0;
+    const r = await fetch(base + '/api/pay', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ method: 'card', email: 'Buyer@Example.com', amount: 500 }),
+    });
+    const b = await r.json();
+    assert.equal(r.status, 200);
+    assert.equal(b.method, 'card');
+    assert.match(b.paymentUrl, /checkout\.example/);
+    const cust = calls.find((c) => c.url.endsWith('/api/v1/customers') && c.opts.method === 'POST');
+    const body = JSON.parse(cust.opts.body).customer;
+    assert.equal(body.billing_configuration.payment_provider, 'paystack');
+    assert.equal(body.email, 'buyer@example.com');
+    assert.match(body.external_id, /^confetti-card-[a-f0-9]{16}$/);
+  });
+
+  it('card rail rejects a bad email without calling the gateway', async () => {
+    calls.length = 0;
+    const r = await fetch(base + '/api/pay', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ method: 'card', email: 'nope', amount: 100 }),
+    });
+    assert.equal(r.status, 400);
+    assert.equal((await r.json()).error, 'invalid-email');
+    assert.equal(calls.length, 0);
+  });
+
+  it('rejects an unknown method', async () => {
+    const r = await fetch(base + '/api/pay', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ method: 'crypto', amount: 100 }),
+    });
+    assert.equal(r.status, 400);
+    assert.equal((await r.json()).error, 'invalid-method');
   });
 });

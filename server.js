@@ -50,6 +50,16 @@ app.use(express.static(path.join(__dirname, 'public')));
 const payments = [];
 const clients = new Set();
 
+function payerLabel(local) {
+  if (local && local.method === 'card') {
+    const e = String(local.email || '');
+    const at = e.indexOf('@');
+    const masked = at > 0 ? e[0] + '***' + e.slice(at) : 'Card';
+    return 'Card ' + masked;
+  }
+  return 'M-Pesa ' + maskPhone(local ? local.phone : '');
+}
+
 function phoneToExternalId(phone) { return 'confetti-' + phone; }
 
 function maskPhone(raw) {
@@ -279,27 +289,38 @@ function darajaErrorPayload(body, res) {
 }
 
 app.post('/api/pay', async (req, res) => {
+  const method = String((req.body && req.body.method) || 'mpesa').toLowerCase();
   const phone = normalizePhone(req.body && req.body.phone);
+  const email = String((req.body && req.body.email) || '').trim();
   const amount = Number(req.body && req.body.amount);
 
-  // Both backends share the same input contract.
-  if (!phone) return res.status(400).json({ error: 'invalid-phone' });
+  if (method !== 'mpesa' && method !== 'card') {
+    return res.status(400).json({ error: 'invalid-method' });
+  }
   if (!Number.isInteger(amount) || amount < 1 || amount > 150000) {
     return res.status(400).json({ error: 'invalid-amount' });
+  }
+  if (method === 'mpesa' && !phone) return res.status(400).json({ error: 'invalid-phone' });
+  if (method === 'card' && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+    return res.status(400).json({ error: 'invalid-email' });
   }
 
   if (useGateway()) {
     try {
-      await gateway.ensureCustomer(phone);
+      const customer = method === 'card'
+        ? await gateway.ensureCardCustomer(email)
+        : await gateway.ensureCustomer(phone);
       await gateway.ensureAddOn();
-      // App sends whole KES; Lago expects minor units. The gateway requires
-      // whole-KES amounts for STK, so multiply by 100 exactly.
-      const invoice = await gateway.createInvoice(phoneToExternalId(phone), amount * 100);
+      // App sends whole KES; Lago expects minor units (×100).
+      const invoice = await gateway.createInvoice(customer.external_id, amount * 100);
       const details = await gateway.requestPayment(invoice.lago_id);
-      pendingGatewayCharges.set(invoice.lago_id, { phone, amount, createdAt: Date.now() });
+      pendingGatewayCharges.set(invoice.lago_id, { method, phone, email, amount, createdAt: Date.now() });
       return res.json({
         checkoutRequestID: invoice.lago_id,
-        customerMessage: 'STK push sent via Lago gateway',
+        method,
+        customerMessage: method === 'card'
+          ? 'Card checkout ready via Lago gateway'
+          : 'STK push sent via Lago gateway',
         paymentUrl: details.payment_url || null,
       });
     } catch (e) {
@@ -309,6 +330,10 @@ app.post('/api/pay', async (req, res) => {
       }
       return res.status(502).json({ errorMessage: g.errorMessage || String((e && e.message) || e) });
     }
+  }
+
+  if (method === 'card') {
+    return res.status(501).json({ error: 'not-configured', hint: 'card rail requires the Lago gateway (set LAGO_API_KEY)' });
   }
 
   if (!darajaConfigured()) {
@@ -378,11 +403,10 @@ app.get('/api/pay/:checkoutRequestID', async (req, res) => {
       const status = String(invoice.payment_status || 'pending');
       if (status === 'succeeded' || status === 'paid') {
         if (local) {
-          const masked = maskPhone(local.phone);
           addPayment({
-            payer: 'M-Pesa ' + masked,
+            payer: payerLabel(local),
             amount: local.amount,
-            phone: masked,
+            phone: local.method === 'card' ? '' : maskPhone(local.phone),
             time: new Date().toISOString(),
             transactionId: chargeKey,
             success: true,
@@ -394,9 +418,9 @@ app.get('/api/pay/:checkoutRequestID', async (req, res) => {
       if (status === 'failed') {
         if (local) {
           addPayment({
-            payer: 'M-Pesa ' + maskPhone(local.phone),
+            payer: payerLabel(local),
             amount: local.amount,
-            phone: maskPhone(local.phone),
+            phone: local.method === 'card' ? '' : maskPhone(local.phone),
             time: new Date().toISOString(),
             transactionId: chargeKey,
             success: false,

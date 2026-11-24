@@ -49,6 +49,8 @@
   #chargeBtn { cursor:pointer; border:none; background:var(--green); color:#fff; border-radius:8px; padding:10px 18px; font-size:1rem; font-weight:700; }
   #chargeBtn:hover:not(:disabled) { filter:brightness(1.05); }
   #chargeBtn:disabled { opacity:.6; cursor:wait; }
+  #charge .methods { display:flex; gap:16px; margin-top:10px; font-size:.95rem; }
+  #charge .methods label { display:inline-flex; align-items:center; gap:6px; cursor:pointer; }
   #chargeStatus { margin-top:10px; font-size:.9rem; color:var(--muted); }
   #chargeStatus.error { color:var(--red); }
   #chargeStatus.ok { color:var(--green); }
@@ -67,10 +69,15 @@
     <div class="card"><div class="label">Biggest payment</div><div class="value" id="statBiggest">—</div><small id="statBiggestBy"></small></div>
     <div class="card"><div class="label">Failed</div><div class="value" id="statFailed">0</div></div>
   </section>
-  <section id="charge" class="card" aria-label="Charge via M-Pesa">
-    <div class="label">Charge via M-Pesa</div>
+  <section id="charge" class="card" aria-label="Take a payment">
+    <div class="label">Take a payment</div>
+    <div class="methods" role="radiogroup" aria-label="Payment method">
+      <label><input type="radio" name="payMethod" value="mpesa" checked> M-Pesa</label>
+      <label><input type="radio" name="payMethod" value="card"> Card</label>
+    </div>
     <div class="row">
       <input id="chargePhone" inputmode="tel" autocomplete="tel" placeholder="0712 345 678">
+      <input id="chargeEmail" type="email" autocomplete="email" placeholder="you@example.com" hidden>
       <input id="chargeAmount" type="number" min="1" max="150000" placeholder="Amount (KES)">
       <button id="chargeBtn" type="button">Charge</button>
     </div>
@@ -256,9 +263,25 @@
   }
   // ---- Real STK-push Charge panel ----
   var chargePhone = document.getElementById('chargePhone');
+  var chargeEmail = document.getElementById('chargeEmail');
   var chargeAmount = document.getElementById('chargeAmount');
   var chargeBtn = document.getElementById('chargeBtn');
   var chargeStatus = document.getElementById('chargeStatus');
+  var methodRadios = document.querySelectorAll('input[name="payMethod"]');
+  function currentMethod() {
+    var m = document.querySelector('input[name="payMethod"]:checked');
+    return m ? m.value : 'mpesa';
+  }
+  function syncMethod() {
+    var card = currentMethod() === 'card';
+    chargePhone.hidden = card;
+    chargeEmail.hidden = !card;
+    chargeBtn.textContent = card ? 'Pay by card' : 'Charge';
+  }
+  methodsLoop: for (var mi = 0; mi < methodRadios.length; mi++) {
+    methodRadios[mi].addEventListener('change', syncMethod);
+  }
+  if (methodRadios.length) syncMethod();
   var pendingCharge = null; // { checkoutRequestID, timer }
   function setChargeStatus(msg, cls) {
     chargeStatus.textContent = msg;
@@ -310,14 +333,16 @@
   }
   if (chargeBtn) {
     chargeBtn.addEventListener('click', function () {
+      var method = currentMethod();
       var phone = (chargePhone.value || '').trim();
+      var email = (chargeEmail.value || '').trim();
       var amount = Number(chargeAmount.value);
       chargeBtn.disabled = true;
-      setChargeStatus('Sending STK push…', '');
+      setChargeStatus(method === 'card' ? 'Creating card checkout…' : 'Sending STK push…', '');
       fetch('/api/pay', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ phone: phone, amount: amount })
+        body: JSON.stringify({ method: method, phone: phone, email: email, amount: amount })
       }).then(function (r) {
         return r.json().catch(function () { return {}; }).then(function (b) { return { status: r.status, body: b }; });
       }).then(function (res) {
@@ -332,9 +357,16 @@
           setChargeStatus('M-Pesa error: ' + (b.errorMessage || 'STK push failed.'), 'error');
           chargeBtn.disabled = false;
         } else if (b.checkoutRequestID) {
-          setChargeStatus('Check ' + phone + ' — enter your M-Pesa PIN to pay KES ' + fmtKES(amount) + '…', 'ok');
-          pendingCharge = { checkoutRequestID: b.checkoutRequestID, timer: null };
-          pendingCharge.timer = setTimeout(function () { pollChargeStatus(b.checkoutRequestID, 5); }, 5000);
+          if (method === 'card' && b.paymentUrl) {
+            setChargeStatus('Opening secure card checkout — enter your card to pay KES ' + fmtKES(amount) + '…', 'ok');
+            window.open(b.paymentUrl, '_blank', 'noopener');
+            pendingCharge = { checkoutRequestID: b.checkoutRequestID, timer: null };
+            pendingCharge.timer = setTimeout(function () { pollChargeStatus(b.checkoutRequestID, 30); }, 4000);
+          } else {
+            setChargeStatus('Check ' + phone + ' — enter your M-Pesa PIN to pay KES ' + fmtKES(amount) + '…', 'ok');
+            pendingCharge = { checkoutRequestID: b.checkoutRequestID, timer: null };
+            pendingCharge.timer = setTimeout(function () { pollChargeStatus(b.checkoutRequestID, 5); }, 5000);
+          }
         } else {
           setChargeStatus('Unexpected response — please try again.', 'error');
           chargeBtn.disabled = false;

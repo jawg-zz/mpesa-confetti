@@ -12,6 +12,9 @@ Safaricom Daraja directly. Set `LAGO_API_KEY` (server-side only) and optionally
 settlement and drives the confetti feed. No PSP secret or callback registration
 is needed in this app.
 
+- Two rails: **M-Pesa** (phone, STK push) and **Card** (email, Paystack checkout).
+  `/api/pay` takes `{method:"mpesa"|"card", phone|email, amount}`; card returns
+  `paymentUrl` for a hosted checkout and settles through the Paystack webhook.
 - `PAYMENT_BACKEND=gateway|daraja` forces a backend (default: gateway when
   `LAGO_API_KEY` is set, otherwise legacy Daraja).
 - `LAGO_ADD_ON_CODE` overrides the one-off add-on code (default `confetti-payment`).

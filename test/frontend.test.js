@@ -79,6 +79,8 @@ describe('index.html charge panel (EventSource lifecycle + resolve guard)', () =
       document: {
         getElementById: (id) => els[id] || (els[id] = makeEl()),
         createElement: () => makeEl(),
+        querySelectorAll: () => [],
+        querySelector: () => null,
       },
       window: {},
       localStorage: { getItem: () => null, setItem() {} },
@@ -105,7 +107,7 @@ describe('index.html charge panel (EventSource lifecycle + resolve guard)', () =
     els.chargeAmount.value = '100';
     click(els.chargeBtn);
     await flush(); await flush();
-    assert.deepEqual(lastCharge, { phone: '0712345678', amount: 100 });
+    assert.deepEqual(lastCharge, { method: 'mpesa', phone: '0712345678', email: '', amount: 100 });
     assert.match(els.chargeStatus.textContent, /^Check /);
     assert.equal(els.chargeBtn.disabled, true);
 

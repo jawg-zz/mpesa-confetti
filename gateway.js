@@ -75,6 +75,41 @@ async function ensureCustomer(phone) {
   }
 }
 
+// Card rail: a Paystack-backed customer. Keyed by a hash of the email so the
+// external_id stays URL-safe and stable across charges.
+async function ensureCardCustomer(email) {
+  const crypto = require('crypto');
+  const norm = String(email || '').trim().toLowerCase();
+  const externalId = 'confetti-card-' + crypto.createHash('sha256').update(norm).digest('hex').slice(0, 16);
+  try {
+    const r = await api('/api/v1/customers', {
+      method: 'POST',
+      body: JSON.stringify({
+        customer: {
+          external_id: externalId,
+          name: 'Card ' + norm,
+          email: norm,
+          currency: 'KES',
+          billing_configuration: {
+            payment_provider: 'paystack',
+            payment_provider_code: 'paystack',
+            provider_customer_id: externalId,
+            sync_with_provider: true,
+          },
+        },
+      }),
+    });
+    return r.customer;
+  } catch (e) {
+    const g = e.gateway || {};
+    const exists = g.status === 422 &&
+      JSON.stringify(g.details || {}).includes('value_already_exist');
+    if (!exists) throw e;
+    const r = await api('/api/v1/customers/' + encodeURIComponent(externalId));
+    return r.customer;
+  }
+}
+
 // One shared add-on; the invoice fee overrides the unit amount per charge.
 async function ensureAddOn() {
   try {
@@ -129,6 +164,7 @@ async function getInvoice(invoiceId) {
 module.exports = {
   configured,
   ensureCustomer,
+  ensureCardCustomer,
   ensureAddOn,
   createInvoice,
   requestPayment,
